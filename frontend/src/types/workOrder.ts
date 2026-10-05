@@ -60,7 +60,7 @@ export interface WorkOrderView extends WorkOrder {
   yardNames: string[];
   /** 天窗时长（分钟） */
   durationMinutes: number;
-  /** 是否与其它作业单时间窗冲突 */
+  /** 是否与其它作业单存在负责人 / 人员 / 机具重叠占用 */
   conflict: boolean;
   /** 冲突的作业单编号 */
   conflictCodes: string[];

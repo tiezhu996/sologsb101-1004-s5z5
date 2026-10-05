@@ -1,12 +1,11 @@
 /**
  * /workorders 天窗作业单编排
- * 勾选病害成单、分配时间窗 / 人员 / 机具并做冲突校验；
+ * 勾选病害成单、分配时间窗 / 人员 / 机具，并判断负责人 / 人员 / 机具占用下的连续可行时段；
  * 消费 WorkOrder、Fault 与 <StatBadge>。
  */
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  Alert,
   Box,
   Button,
   Checkbox,
@@ -60,7 +59,9 @@ import {
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL, type FaultSeverity } from '../types/fault';
 import { ROUTES } from '../router/routes';
-import { endTimeOf, findMachineConflicts, findMemberConflicts, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
+import { endTimeOf, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
+import { evaluateDraftSchedule, type DraftScheduleResult } from '../utils/schedule';
+import DraftSchedulePanel from '../components/schedule/DraftSchedulePanel';
 import { share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
 import StatBadge from '../components/common/StatBadge';
@@ -97,6 +98,10 @@ export default function WorkOrderPlan() {
   const planable = useAppSelector(selectPlanableFaults);
   const stats = useAppSelector(selectWindowStats);
   const allOrderRows = useAppSelector((state) => state.workOrder.workOrders);
+  const faults = useAppSelector((state) => state.workOrder.faults);
+  const inspections = useAppSelector((state) => state.workOrder.inspections);
+  const switches = useAppSelector((state) => state.workOrder.switches);
+  const yards = useAppSelector((state) => state.workOrder.yards);
 
   const [toast, setToast] = useState('');
   const [selectedFaults, setSelectedFaults] = useState<string[]>([]);
@@ -106,43 +111,31 @@ export default function WorkOrderPlan() {
     form: defaultForm(),
   });
 
-  /** 当前表单的冲突预检结果 */
-  const draftConflicts = useMemo(() => {
-    const others = allOrderRows
-      .filter((item) => item.id !== dialog.editingId)
-      .map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-        members: item.members,
-        machines: item.machines,
-      }));
-    const target = {
-      id: dialog.editingId ?? 'draft',
-      windowStart: dialog.form.windowStart,
-      windowEnd: dialog.form.windowEnd,
-      members: dialog.form.members,
-      machines: dialog.form.machines,
-    };
-    const timeConflicts = others.filter(
-      (item) => item.windowStart < target.windowEnd && target.windowStart < item.windowEnd,
-    );
-    const memberConflicts = findMemberConflicts(
-      { id: target.id, windowStart: target.windowStart, windowEnd: target.windowEnd, members: target.members },
-      others,
-    );
-    const machineConflicts = findMachineConflicts(
-      { id: target.id, windowStart: target.windowStart, windowEnd: target.windowEnd, machines: target.machines },
-      others,
-    );
-    return {
-      time: timeConflicts.map((item) => item.code),
-      members: memberConflicts,
-      machines: machineConflicts,
-      duration: windowMinutes({ windowStart: target.windowStart, windowEnd: target.windowEnd }),
-    };
-  }, [allOrderRows, dialog]);
+  /** 当前表单的天窗时长 */
+  const draftDuration = useMemo(
+    () => windowMinutes({ windowStart: dialog.form.windowStart, windowEnd: dialog.form.windowEnd }),
+    [dialog.form.windowStart, dialog.form.windowEnd],
+  );
+
+  /** 当前草稿的可行时段：负责人、人员、机具任一重叠均占用连续时间 */
+  const draftSchedule = useMemo(
+    () =>
+      evaluateDraftSchedule({
+        windowStart: dialog.form.windowStart,
+        windowEnd: dialog.form.windowEnd,
+        leader: dialog.form.leader,
+        members: dialog.form.members,
+        machines: dialog.form.machines,
+        faultIds: dialog.form.faultIds,
+        editingOrderId: dialog.editingId,
+        workOrders: allOrderRows,
+        faults,
+        inspections,
+        switches,
+        yards,
+      }),
+    [allOrderRows, dialog, faults, inspections, switches, yards],
+  );
 
   const openCreate = (): void => {
     const next = defaultForm();
@@ -166,6 +159,18 @@ export default function WorkOrderPlan() {
     });
   };
 
+  const applyRecommendation = (recommendation: NonNullable<DraftScheduleResult['recommendation']>): void => {
+    setDialog((prev) => ({
+      ...prev,
+      form: {
+        ...prev.form,
+        windowStart: recommendation.windowStart,
+        windowEnd: recommendation.windowEnd,
+      },
+    }));
+    setToast('已把建议时段写入当前草稿，已保存作业单未改动');
+  };
+
   const submit = async (): Promise<void> => {
     if (!dialog.form.leader.trim()) {
       setToast('请选择负责人');
@@ -179,16 +184,33 @@ export default function WorkOrderPlan() {
       setToast('天窗止必须晚于天窗起');
       return;
     }
+    if (!draftSchedule.canSave) {
+      const blockerCodes = draftSchedule.currentBlockers.map((item) => item.code);
+      setToast(
+        blockerCodes.length > 0
+          ? `当前病害排不下，被 ${blockerCodes.join('、')} 的负责人 / 人员 / 机具占用`
+          : draftSchedule.blockingItems.length > 0
+            ? '当前连续时段放不下重级病害，请调整时间或资源'
+            : '当前连续时段连首处病害都放不下，请调整时间或资源',
+      );
+      return;
+    }
     if (dialog.editingId) {
-      await dispatch(updateWorkOrder({ id: dialog.editingId, draft: dialog.form }));
-      setToast('作业单已更新');
+      try {
+        const result = await dispatch(updateWorkOrder({ id: dialog.editingId, draft: dialog.form })).unwrap();
+        setToast(result.postponedCount > 0 ? `作业单已更新，${result.postponedCount} 处中 / 轻级病害已延后` : '作业单已更新');
+      } catch (error) {
+        setToast(`更新失败：${error instanceof Error ? error.message : '未知错误'}`);
+        return;
+      }
     } else {
       try {
         const result = await dispatch(createWorkOrder(dialog.form)).unwrap();
+        const postponedText = result.postponedFaultIds.length > 0 ? `，${result.postponedFaultIds.length} 处中 / 轻级病害已延后` : '';
         setToast(
-          result.conflicts.length > 0
-            ? `作业单已创建，但与 ${result.conflicts.join('、')} 时间窗重叠，请复核`
-            : '作业单已创建',
+          result.resourceConflicts.length > 0
+            ? `作业单已创建，但与 ${result.resourceConflicts.join('、')} 存在资源占用，请复核${postponedText}`
+            : `作业单已创建${postponedText}`,
         );
       } catch (error) {
         setToast(`建单失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -207,7 +229,7 @@ export default function WorkOrderPlan() {
             天窗作业单编排
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            勾选待修病害成单，分配天窗时间窗、负责人、作业人员与机具，并做时间窗 / 人员 / 机具三重冲突校验。
+            勾选待修病害成单，系统按负责人、作业人员与机具占用计算连续可行时段，重级放不下时拦截保存。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -236,11 +258,11 @@ export default function WorkOrderPlan() {
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
           <StatBadge
-            title="时间窗冲突"
+            title="资源占用冲突"
             value={stats.conflictCount}
             suffix="张"
             color={stats.conflictCount > 0 ? '#d32f2f' : '#2e7d32'}
-            hint="同一时间窗内存在重叠作业单"
+            hint="同一时间窗内存在负责人 / 人员 / 机具重叠占用"
           />
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
@@ -362,8 +384,8 @@ export default function WorkOrderPlan() {
                         </Typography>
                         <Chip size="small" label={WORK_ORDER_STATE_LABEL[order.state]} color={order.state === 'done' ? 'success' : 'default'} />
                         {order.conflict ? (
-                          <Tooltip title={`与 ${order.conflictCodes.join('、')} 时间窗重叠`}>
-                            <Chip size="small" color="error" icon={<WarningAmberIcon />} label="时间窗冲突" />
+                          <Tooltip title={`与 ${order.conflictCodes.join('、')} 的负责人 / 人员 / 机具重叠占用`}>
+                            <Chip size="small" color="error" icon={<WarningAmberIcon />} label="资源占用冲突" />
                           </Tooltip>
                         ) : null}
                         {order.memberConflict ? <Chip size="small" color="warning" label="人员占用冲突" /> : null}
@@ -449,7 +471,7 @@ export default function WorkOrderPlan() {
                     form: {
                       ...prev.form,
                       windowStart: event.target.value.replace('T', ' '),
-                      windowEnd: endTimeOf(event.target.value.replace('T', ' '), draftConflicts.duration || 120),
+                      windowEnd: endTimeOf(event.target.value.replace('T', ' '), draftDuration || 120),
                     },
                   }))
                 }
@@ -477,7 +499,16 @@ export default function WorkOrderPlan() {
                 <Select
                   label="负责人"
                   value={dialog.form.leader}
-                  onChange={(event) => setDialog((prev) => ({ ...prev, form: { ...prev.form, leader: event.target.value } }))}
+                  onChange={(event) =>
+                    setDialog((prev) => ({
+                      ...prev,
+                      form: {
+                        ...prev.form,
+                        leader: event.target.value,
+                        members: [...new Set([event.target.value, ...prev.form.members])],
+                      },
+                    }))
+                  }
                 >
                   {[...new Set([...MEMBER_LIBRARY, ...dialog.form.members])].map((name) => (
                     <MenuItem key={name} value={name}>
@@ -579,14 +610,7 @@ export default function WorkOrderPlan() {
             </Grid>
 
             <Grid item xs={12}>
-              <Alert
-                severity={draftConflicts.time.length > 0 || draftConflicts.members.length > 0 ? 'warning' : 'success'}
-              >
-                冲突预检：时间窗重叠 {draftConflicts.time.length > 0 ? draftConflicts.time.join('、') : '无'} · 人员占用{' '}
-                {draftConflicts.members.length > 0 ? draftConflicts.members.join('、') : '无'} · 机具占用{' '}
-                {draftConflicts.machines.length > 0 ? draftConflicts.machines.join('、') : '无'} · 天窗时长{' '}
-                {formatDuration(draftConflicts.duration)}
-              </Alert>
+              <DraftSchedulePanel result={draftSchedule} onApplyRecommendation={applyRecommendation} />
             </Grid>
 
             <Grid item xs={12}>
@@ -627,8 +651,10 @@ export default function WorkOrderPlan() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialog((prev) => ({ ...prev, open: false }))}>取消</Button>
-          <Button variant="contained" onClick={() => void submit()}>
-            保存
+          <Button variant="contained" disabled={!draftSchedule.canSave} onClick={() => void submit()}>
+            {draftSchedule.postponedItems.length > 0
+              ? `保存并延后 ${draftSchedule.postponedItems.length} 处`
+              : '保存'}
           </Button>
         </DialogActions>
       </Dialog>

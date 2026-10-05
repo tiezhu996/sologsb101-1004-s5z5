@@ -26,7 +26,8 @@ docker compose up -d --build # 代码改动后重建
 - 建立站场与道岔台账（辙叉号 9/12/18、轨型 60kg/m 与 50kg/m），按辙叉号与轨型筛选
 - 按巡检批次录入病害并定位到部件（尖轨 / 基本轨 / 辙叉 / 转辙机）
 - 评定病害等级（轻 / 中 / 重）、批量调整、批量升级、手工销号与撤销
-- 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
+- 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具；系统沿巡检 → 道岔 → 站场归组，按负责人、人员、机具重叠占用计算当前草稿的连续可行时段，重级排不下时拦截保存并指出占用单
+- 排程遵循重级优先、同站场连续，再安排中 / 轻级；当前连续时段不足时先延后轻级，保存只更新当前草稿，不改动其它已保存作业单（演示口径：重 / 中 / 轻单处耗时分别按 60 / 45 / 30 分钟估算）
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
 
@@ -52,7 +53,7 @@ docker compose up -d --build # 代码改动后重建
 | `/yards` | 站场与道岔台账 | 建立站场与道岔，按辙叉号与轨型筛选 |
 | `/inspections` | 巡检与病害录入 | 按巡检批次录入病害并定位到部件 |
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
-| `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
+| `/workorders` | 天窗作业单编排 | 勾选病害成单，按负责人 / 人员 / 机具占用计算可行时段，重级阻塞时拦截保存 |
 | `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
@@ -83,11 +84,12 @@ sologsb101-1004/
         ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts
         ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts
         ├── components/common/   # SeverityTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/schedule/ # DraftSchedulePanel.tsx
         ├── hooks/               # useFaultFilter.ts useIdbTable.ts useAppStore.ts
         ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx BackupView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # severity.ts window.ts db.ts export.ts events.ts format.ts
+        └── utils/               # severity.ts window.ts schedule.ts db.ts export.ts events.ts format.ts
 ```
 
 ## 六、数据存储说明

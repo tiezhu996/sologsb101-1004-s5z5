@@ -27,12 +27,15 @@ import {
   type WorkOrderView,
 } from '../types/workOrder';
 import {
-  findConflicts,
   findMachineConflicts,
   findMemberConflicts,
   nowDateTime,
   windowMinutes,
 } from '../utils/window';
+import {
+  evaluateDraftSchedule,
+  scheduledFaultIds,
+} from '../utils/schedule';
 import { emitChange } from '../utils/events';
 
 export interface WorkOrderStateSlice {
@@ -57,6 +60,36 @@ const initialState: WorkOrderStateSlice = {
   loading: false,
   error: '',
 };
+
+function evaluateOrderDraft(
+  state: WorkOrderStateSlice,
+  draft: WorkOrderDraft,
+  editingOrderId?: string | null,
+) {
+  return evaluateDraftSchedule({
+    windowStart: draft.windowStart,
+    windowEnd: draft.windowEnd,
+    leader: draft.leader,
+    members: draft.members,
+    machines: draft.machines,
+    faultIds: draft.faultIds,
+    editingOrderId,
+    workOrders: state.workOrders,
+    faults: state.faults,
+    inspections: state.inspections,
+    switches: state.switches,
+    yards: state.yards,
+  });
+}
+
+function blockedOrderMessage(codes: string[], schedule: ReturnType<typeof evaluateOrderDraft>): string {
+  if (codes.length > 0) {
+    return `重级病害连续时段不足，被 ${codes.join('、')} 的负责人 / 人员 / 机具占用挡住，请调整资源或时段`;
+  }
+  return schedule.scheduledItems.length === 0
+    ? '当前连续时段连首处病害都放不下，请调大天窗、更换资源或延后其它病害'
+    : '当前连续时段放不下重级病害，请调大天窗或延后其它病害';
+}
 
 export const loadWorkOrderData = createAsyncThunk<
   {
@@ -83,28 +116,35 @@ export const loadWorkOrderData = createAsyncThunk<
   }
 });
 
-/** 新建作业单：把勾选病害编排进同一时间窗，并回传时间窗冲突编号 */
+/** 新建作业单：仅保存当前草稿可行时段内能连续排入的病害，并回传资源冲突编号 */
 export const createWorkOrder = createAsyncThunk<
-  { created: boolean; conflicts: string[] },
+  {
+    created: boolean;
+    resourceConflicts: string[];
+    scheduledFaultIds: string[];
+    postponedFaultIds: string[];
+  },
   WorkOrderDraft,
   { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
 >('workOrder/create', async (draft, { getState, rejectWithValue }) => {
   try {
     const state = getState().workOrder;
-    const conflicts = findConflicts(
-      { id: 'pending', windowStart: draft.windowStart, windowEnd: draft.windowEnd },
-      state.workOrders.map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-      })),
-    ).map((item) => item.code);
+    const schedule = evaluateOrderDraft(state, draft);
+    if (!schedule.canSave) {
+      const blockerCodes = schedule.currentBlockers.map((item) => item.code);
+      return rejectWithValue(
+        blockerCodes.length > 0
+          ? blockedOrderMessage(blockerCodes, schedule)
+          : '当前连续时段放不下重级病害，请调大天窗或延后其它病害',
+      );
+    }
+
+    const feasibleFaultIds = scheduledFaultIds(schedule);
 
     await putWorkOrder({
       id: `wo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       code: draft.code.trim() || buildWorkOrderCode(new Date(), state.workOrders.length + 1),
-      faultIds: draft.faultIds,
+      faultIds: feasibleFaultIds,
       windowStart: draft.windowStart,
       windowEnd: draft.windowEnd,
       leader: draft.leader.trim(),
@@ -116,25 +156,41 @@ export const createWorkOrder = createAsyncThunk<
       revision: ROW_REVISION,
     });
     emitChange();
-    return { created: true, conflicts };
+    return {
+      created: true,
+      resourceConflicts: schedule.currentBlockers.map((item) => item.code),
+      scheduledFaultIds: feasibleFaultIds,
+      postponedFaultIds: schedule.postponedItems.map((item) => item.id),
+    };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '新建作业单失败');
   }
 });
 
 export const updateWorkOrder = createAsyncThunk<
-  void,
+  { postponedCount: number },
   { id: string; draft: WorkOrderDraft },
   { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
 >('workOrder/update', async ({ id, draft }, { getState, rejectWithValue }) => {
   try {
     const state = getState().workOrder;
     const existing = state.workOrders.find((item) => item.id === id);
-    if (!existing) return;
+    if (!existing) return { postponedCount: 0 };
+    const schedule = evaluateOrderDraft(state, draft, id);
+    if (!schedule.canSave) {
+      const blockerCodes = schedule.currentBlockers.map((item) => item.code);
+      return rejectWithValue(
+        blockerCodes.length > 0
+          ? blockedOrderMessage(blockerCodes, schedule)
+          : '当前连续时段放不下重级病害，请调大天窗或延后其它病害',
+      );
+    }
+
+    const feasibleFaultIds = scheduledFaultIds(schedule);
     await putWorkOrder({
       ...existing,
       code: draft.code.trim(),
-      faultIds: draft.faultIds,
+      faultIds: feasibleFaultIds,
       windowStart: draft.windowStart,
       windowEnd: draft.windowEnd,
       leader: draft.leader.trim(),
@@ -143,6 +199,7 @@ export const updateWorkOrder = createAsyncThunk<
       updatedAt: nowDateTime(),
     });
     emitChange();
+    return { postponedCount: schedule.postponedItems.length };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '更新作业单失败');
   }
@@ -270,9 +327,18 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         ),
       ];
       const others = workOrders.filter((item) => item.id !== order.id);
-      const conflictCodes = others
-        .filter((item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd)
-        .map((item) => item.code);
+      const overlappingOrders = others.filter(
+        (item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd,
+      );
+      const resourceConflicts = overlappingOrders.filter(
+        (item) =>
+          item.leader === order.leader ||
+          item.members.includes(order.leader) ||
+          order.members.includes(item.leader) ||
+          item.members.some((member) => order.members.includes(member)) ||
+          item.machines.some((machine) => order.machines.includes(machine)),
+      );
+      const conflictCodes = resourceConflicts.map((item) => item.code);
       const memberConflicts = findMemberConflicts(
         { id: order.id, windowStart: order.windowStart, windowEnd: order.windowEnd, members: order.members },
         others.map((item) => ({
