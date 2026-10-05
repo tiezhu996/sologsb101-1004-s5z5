@@ -60,7 +60,8 @@ import {
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL, type FaultSeverity } from '../types/fault';
 import { ROUTES } from '../router/routes';
-import { endTimeOf, findMachineConflicts, findMemberConflicts, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
+import { endTimeOf, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
+import { evaluateWorkOrderDraft, feasibilityBlockReason, type OccupationBlock } from '../utils/schedule';
 import { share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
 import StatBadge from '../components/common/StatBadge';
@@ -90,6 +91,17 @@ function defaultForm(): OrderFormState {
   };
 }
 
+function occupationText(block: OccupationBlock): string {
+  const resources = [
+    block.leaderNames.length > 0 ? `负责人 ${block.leaderNames.join('、')}` : '',
+    block.people.filter((person) => !block.leaderNames.includes(person)).length > 0
+      ? `人员 ${block.people.filter((person) => !block.leaderNames.includes(person)).join('、')}`
+      : '',
+    block.machines.length > 0 ? `机具 ${block.machines.join('、')}` : '',
+  ].filter(Boolean);
+  return `${block.code}（${block.windowStart} ~ ${block.windowEnd.slice(-5)}：${resources.join('；')}）`;
+}
+
 export default function WorkOrderPlan() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
@@ -97,6 +109,10 @@ export default function WorkOrderPlan() {
   const planable = useAppSelector(selectPlanableFaults);
   const stats = useAppSelector(selectWindowStats);
   const allOrderRows = useAppSelector((state) => state.workOrder.workOrders);
+  const faults = useAppSelector((state) => state.workOrder.faults);
+  const inspections = useAppSelector((state) => state.workOrder.inspections);
+  const switches = useAppSelector((state) => state.workOrder.switches);
+  const yards = useAppSelector((state) => state.workOrder.yards);
 
   const [toast, setToast] = useState('');
   const [selectedFaults, setSelectedFaults] = useState<string[]>([]);
@@ -106,43 +122,21 @@ export default function WorkOrderPlan() {
     form: defaultForm(),
   });
 
-  /** 当前表单的冲突预检结果 */
-  const draftConflicts = useMemo(() => {
-    const others = allOrderRows
-      .filter((item) => item.id !== dialog.editingId)
-      .map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-        members: item.members,
-        machines: item.machines,
-      }));
-    const target = {
-      id: dialog.editingId ?? 'draft',
-      windowStart: dialog.form.windowStart,
-      windowEnd: dialog.form.windowEnd,
-      members: dialog.form.members,
-      machines: dialog.form.machines,
-    };
-    const timeConflicts = others.filter(
-      (item) => item.windowStart < target.windowEnd && target.windowStart < item.windowEnd,
-    );
-    const memberConflicts = findMemberConflicts(
-      { id: target.id, windowStart: target.windowStart, windowEnd: target.windowEnd, members: target.members },
-      others,
-    );
-    const machineConflicts = findMachineConflicts(
-      { id: target.id, windowStart: target.windowStart, windowEnd: target.windowEnd, machines: target.machines },
-      others,
-    );
-    return {
-      time: timeConflicts.map((item) => item.code),
-      members: memberConflicts,
-      machines: machineConflicts,
-      duration: windowMinutes({ windowStart: target.windowStart, windowEnd: target.windowEnd }),
-    };
-  }, [allOrderRows, dialog]);
+  /** 当前草稿的可行时段与资源占用预检 */
+  const feasibility = useMemo(
+    () =>
+      evaluateWorkOrderDraft({
+        draft: dialog.form,
+        editingId: dialog.editingId,
+        faults,
+        inspections,
+        switches,
+        yards,
+        workOrders: allOrderRows,
+      }),
+    [allOrderRows, dialog, faults, inspections, switches, yards],
+  );
+  const draftBlockReason = feasibilityBlockReason(feasibility);
 
   const openCreate = (): void => {
     const next = defaultForm();
@@ -166,6 +160,25 @@ export default function WorkOrderPlan() {
     });
   };
 
+  const applyFeasiblePlan = (plan: typeof feasibility.laterPlan = feasibility.recommendedPlan ?? feasibility.laterPlan): void => {
+    const window = plan?.window ?? feasibility.suggestedWindow;
+    if (!window) {
+      setToast(draftBlockReason ?? '当前草稿暂不可调整');
+      return;
+    }
+    const faultIds = plan ? plan.scheduledIds : feasibility.scheduledFaults.map((item) => item.id);
+    setDialog((prev) => ({
+      ...prev,
+      form: {
+        ...prev.form,
+        windowStart: window.start,
+        windowEnd: window.end,
+        faultIds,
+      },
+    }));
+    setSelectedFaults(faultIds);
+  };
+
   const submit = async (): Promise<void> => {
     if (!dialog.form.leader.trim()) {
       setToast('请选择负责人');
@@ -180,8 +193,13 @@ export default function WorkOrderPlan() {
       return;
     }
     if (dialog.editingId) {
-      await dispatch(updateWorkOrder({ id: dialog.editingId, draft: dialog.form }));
-      setToast('作业单已更新');
+      try {
+        await dispatch(updateWorkOrder({ id: dialog.editingId, draft: dialog.form })).unwrap();
+        setToast('作业单已更新');
+      } catch (error) {
+        setToast(`更新被挡住：${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
     } else {
       try {
         const result = await dispatch(createWorkOrder(dialog.form)).unwrap();
@@ -207,7 +225,7 @@ export default function WorkOrderPlan() {
             天窗作业单编排
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            勾选待修病害成单，分配天窗时间窗、负责人、作业人员与机具，并做时间窗 / 人员 / 机具三重冲突校验。
+            勾选待修病害成单，系统沿巡检、道岔、站场读取占用，按负责人、人员和机具重叠计算连续可行时段。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -301,6 +319,7 @@ export default function WorkOrderPlan() {
                         />
                       </TableCell>
                       <TableCell>病害</TableCell>
+                      <TableCell>站场</TableCell>
                       <TableCell>等级</TableCell>
                       <TableCell align="right">操作</TableCell>
                     </TableRow>
@@ -319,6 +338,7 @@ export default function WorkOrderPlan() {
                           />
                         </TableCell>
                         <TableCell>{item.label}</TableCell>
+                        <TableCell>{item.yardName}</TableCell>
                         <TableCell>
                           <SeverityTag severity={item.severity as FaultSeverity} />
                         </TableCell>
@@ -366,6 +386,7 @@ export default function WorkOrderPlan() {
                             <Chip size="small" color="error" icon={<WarningAmberIcon />} label="时间窗冲突" />
                           </Tooltip>
                         ) : null}
+                        {order.leaderConflict ? <Chip size="small" color="warning" label="负责人占用冲突" /> : null}
                         {order.memberConflict ? <Chip size="small" color="warning" label="人员占用冲突" /> : null}
                         {order.machineConflict ? <Chip size="small" color="warning" label="机具占用冲突" /> : null}
                       </Stack>
@@ -444,14 +465,18 @@ export default function WorkOrderPlan() {
                 InputLabelProps={{ shrink: true }}
                 value={dialog.form.windowStart.replace(' ', 'T')}
                 onChange={(event) =>
-                  setDialog((prev) => ({
-                    ...prev,
-                    form: {
-                      ...prev.form,
-                      windowStart: event.target.value.replace('T', ' '),
-                      windowEnd: endTimeOf(event.target.value.replace('T', ' '), draftConflicts.duration || 120),
-                    },
-                  }))
+                  setDialog((prev) => {
+                    const nextStart = event.target.value.replace('T', ' ');
+                    const duration = windowMinutes({ windowStart: prev.form.windowStart, windowEnd: prev.form.windowEnd }) || 120;
+                    return {
+                      ...prev,
+                      form: {
+                        ...prev.form,
+                        windowStart: nextStart,
+                        windowEnd: endTimeOf(nextStart, duration),
+                      },
+                    };
+                  })
                 }
               />
             </Grid>
@@ -579,14 +604,91 @@ export default function WorkOrderPlan() {
             </Grid>
 
             <Grid item xs={12}>
-              <Alert
-                severity={draftConflicts.time.length > 0 || draftConflicts.members.length > 0 ? 'warning' : 'success'}
-              >
-                冲突预检：时间窗重叠 {draftConflicts.time.length > 0 ? draftConflicts.time.join('、') : '无'} · 人员占用{' '}
-                {draftConflicts.members.length > 0 ? draftConflicts.members.join('、') : '无'} · 机具占用{' '}
-                {draftConflicts.machines.length > 0 ? draftConflicts.machines.join('、') : '无'} · 天窗时长{' '}
-                {formatDuration(draftConflicts.duration)}
+              <Alert severity={feasibility.status === 'blocked' ? 'error' : feasibility.status === 'deferred' ? 'warning' : 'success'}>
+                {feasibility.status === 'ready'
+                  ? `可行时段：草稿从 ${dialog.form.windowStart} 起可连续安排 ${feasibility.scheduledCount}/${feasibility.selectedCount} 处病害（${formatDuration(
+                      feasibility.scheduledMinutes,
+                    )}）`
+                  : draftBlockReason}
               </Alert>
+            </Grid>
+
+            <Grid item xs={12}>
+              <Paper variant="outlined" sx={{ p: 1.25, borderRadius: 1.5 }}>
+                <Stack spacing={1}>
+                  <Typography variant="subtitle2" fontWeight={600}>
+                    可行时段判断（负责人 / 人员 / 机具重叠占用）
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    当前草稿天窗 {dialog.form.windowStart} ~ {dialog.form.windowEnd.slice(-5)}（
+                    {formatDuration(feasibility.draftWindowMinutes)}）· 需要 {formatDuration(feasibility.requiredMinutes)} ·
+                    可连续排入 {formatDuration(feasibility.scheduledMinutes)} · 重级 {feasibility.heavyCount} 处
+                    （工时按重 60 / 中 45 / 轻 30 分钟估算）
+                    {feasibility.currentGap
+                      ? ` · 连续空闲至 ${feasibility.currentGap.end.slice(-5)}（${formatDuration(feasibility.currentGap.minutes)}）`
+                      : ''}
+                  </Typography>
+
+                  {feasibility.scheduledFaults.length > 0 ? (
+                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                      {feasibility.scheduledFaults.map((item, index) => (
+                        <Chip
+                          key={item.id}
+                          size="small"
+                          color={item.severity === 'heavy' ? 'error' : item.severity === 'medium' ? 'warning' : 'default'}
+                          label={`${index + 1}. ${FAULT_SEVERITY_LABEL[item.severity]} ${item.yardName} ${item.switchCode} ${item.start.slice(-5)}-${item.end.slice(-5)}`}
+                        />
+                      ))}
+                    </Stack>
+                  ) : null}
+
+                  {feasibility.deferredFaults.length > 0 ? (
+                    <Typography variant="caption" color="warning.main">
+                      先延后 {feasibility.deferredFaults.length} 处：
+                      {feasibility.deferredFaults
+                        .map((item) => `${FAULT_SEVERITY_LABEL[item.severity]} ${item.yardName} ${item.switchCode}`)
+                        .join('、')}
+                    </Typography>
+                  ) : null}
+
+                  {(feasibility.blockingOccupations.length > 0 || feasibility.resourceOccupations.length > 0) &&
+                  feasibility.status === 'blocked' ? (
+                    <Typography variant="caption" color="error.main">
+                      被占用：
+                      {[...new Map([...feasibility.blockingOccupations, ...feasibility.resourceOccupations].map((item) => [item.id, item])).values()]
+                        .map(occupationText)
+                        .join('；')}
+                    </Typography>
+                  ) : null}
+
+                  <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                    {feasibility.status === 'blocked' && feasibility.recommendedPlan ? (
+                      <Button size="small" color="primary" variant="contained" onClick={() => applyFeasiblePlan(feasibility.recommendedPlan)}>
+                        重级改排到 {feasibility.recommendedPlan.window.start} ~{' '}
+                        {feasibility.recommendedPlan.window.end.slice(-5)}
+                        {feasibility.recommendedPlan.deferredFaults.length > 0
+                          ? `，延后 ${feasibility.recommendedPlan.deferredFaults.length} 处`
+                          : ''}
+                      </Button>
+                    ) : null}
+                    {feasibility.laterPlan ? (
+                      <Button size="small" variant="outlined" onClick={() => applyFeasiblePlan(feasibility.laterPlan)}>
+                        改到后续时段多排 {feasibility.laterPlan.scheduledIds.length} 处
+                      </Button>
+                    ) : null}
+                    {feasibility.status === 'deferred' && feasibility.suggestedWindow ? (
+                      <Button size="small" color="warning" variant="contained" onClick={() => applyFeasiblePlan(null)}>
+                        先保留 {feasibility.scheduledCount} 处，延后 {feasibility.deferredFaults.length} 处
+                      </Button>
+                    ) : null}
+                    {!feasibility.canSave && feasibility.status === 'ready' && feasibility.suggestedWindow ? (
+                      <Button size="small" variant="contained" onClick={() => applyFeasiblePlan(null)}>
+                        补齐天窗至 {feasibility.suggestedWindow.end.slice(-5)}
+                      </Button>
+                    ) : null}
+                  </Stack>
+                </Stack>
+              </Paper>
             </Grid>
 
             <Grid item xs={12}>
@@ -627,7 +729,7 @@ export default function WorkOrderPlan() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialog((prev) => ({ ...prev, open: false }))}>取消</Button>
-          <Button variant="contained" onClick={() => void submit()}>
+          <Button variant="contained" disabled={!feasibility.canSave} onClick={() => void submit()}>
             保存
           </Button>
         </DialogActions>

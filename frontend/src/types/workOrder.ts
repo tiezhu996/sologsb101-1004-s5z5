@@ -66,6 +66,8 @@ export interface WorkOrderView extends WorkOrder {
   conflictCodes: string[];
   /** 人员占用冲突 */
   memberConflict: boolean;
+  /** 负责人占用冲突 */
+  leaderConflict: boolean;
   /** 机具占用冲突 */
   machineConflict: boolean;
   /** 关联病害中仍未销号的数量 */

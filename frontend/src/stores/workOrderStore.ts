@@ -26,14 +26,9 @@ import {
   type WorkOrderState,
   type WorkOrderView,
 } from '../types/workOrder';
-import {
-  findConflicts,
-  findMachineConflicts,
-  findMemberConflicts,
-  nowDateTime,
-  windowMinutes,
-} from '../utils/window';
+import { nowDateTime, windowMinutes } from '../utils/window';
 import { emitChange } from '../utils/events';
+import { evaluateWorkOrderDraft, feasibilityBlockReason } from '../utils/schedule';
 
 export interface WorkOrderStateSlice {
   workOrders: WorkOrderRow[];
@@ -83,7 +78,7 @@ export const loadWorkOrderData = createAsyncThunk<
   }
 });
 
-/** 新建作业单：把勾选病害编排进同一时间窗，并回传时间窗冲突编号 */
+/** 新建作业单：按可行时段校验通过后保存，并回传仍重叠的资源占用编号 */
 export const createWorkOrder = createAsyncThunk<
   { created: boolean; conflicts: string[] },
   WorkOrderDraft,
@@ -91,15 +86,18 @@ export const createWorkOrder = createAsyncThunk<
 >('workOrder/create', async (draft, { getState, rejectWithValue }) => {
   try {
     const state = getState().workOrder;
-    const conflicts = findConflicts(
-      { id: 'pending', windowStart: draft.windowStart, windowEnd: draft.windowEnd },
-      state.workOrders.map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-      })),
-    ).map((item) => item.code);
+    const feasibility = evaluateWorkOrderDraft({
+      draft,
+      faults: state.faults,
+      inspections: state.inspections,
+      switches: state.switches,
+      yards: state.yards,
+      workOrders: state.workOrders,
+    });
+    const blockReason = feasibilityBlockReason(feasibility);
+    if (blockReason) {
+      return rejectWithValue(blockReason);
+    }
 
     await putWorkOrder({
       id: `wo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -116,7 +114,7 @@ export const createWorkOrder = createAsyncThunk<
       revision: ROW_REVISION,
     });
     emitChange();
-    return { created: true, conflicts };
+    return { created: true, conflicts: feasibility.resourceOccupations.map((item) => item.code) };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '新建作业单失败');
   }
@@ -131,6 +129,20 @@ export const updateWorkOrder = createAsyncThunk<
     const state = getState().workOrder;
     const existing = state.workOrders.find((item) => item.id === id);
     if (!existing) return;
+    const feasibility = evaluateWorkOrderDraft({
+      draft,
+      editingId: id,
+      faults: state.faults,
+      inspections: state.inspections,
+      switches: state.switches,
+      yards: state.yards,
+      workOrders: state.workOrders,
+    });
+    const blockReason = feasibilityBlockReason(feasibility);
+    if (blockReason) {
+      return rejectWithValue(blockReason);
+    }
+
     await putWorkOrder({
       ...existing,
       code: draft.code.trim(),
@@ -273,25 +285,23 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
       const conflictCodes = others
         .filter((item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd)
         .map((item) => item.code);
-      const memberConflicts = findMemberConflicts(
-        { id: order.id, windowStart: order.windowStart, windowEnd: order.windowEnd, members: order.members },
-        others.map((item) => ({
-          id: item.id,
-          code: item.code,
-          windowStart: item.windowStart,
-          windowEnd: item.windowEnd,
-          members: item.members,
-        })),
+      const memberConflict = others.some(
+        (item) =>
+          item.windowStart < order.windowEnd &&
+          order.windowStart < item.windowEnd &&
+          item.members.some((member) => order.members.includes(member)),
       );
-      const machineConflicts = findMachineConflicts(
-        { id: order.id, windowStart: order.windowStart, windowEnd: order.windowEnd, machines: order.machines },
-        others.map((item) => ({
-          id: item.id,
-          code: item.code,
-          windowStart: item.windowStart,
-          windowEnd: item.windowEnd,
-          machines: item.machines,
-        })),
+      const leaderConflict = others.some(
+        (item) =>
+          item.windowStart < order.windowEnd &&
+          order.windowStart < item.windowEnd &&
+          (item.leader === order.leader || item.members.includes(order.leader)),
+      );
+      const machineConflict = others.some(
+        (item) =>
+          item.windowStart < order.windowEnd &&
+          order.windowStart < item.windowEnd &&
+          item.machines.some((machine) => order.machines.includes(machine)),
       );
       return {
         ...order,
@@ -300,8 +310,9 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         durationMinutes: windowMinutes({ windowStart: order.windowStart, windowEnd: order.windowEnd }),
         conflict: conflictCodes.length > 0,
         conflictCodes,
-        memberConflict: memberConflicts.length > 0,
-        machineConflict: machineConflicts.length > 0,
+        memberConflict,
+        leaderConflict,
+        machineConflict,
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
       };
     })
@@ -311,21 +322,42 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
 /** 待编排病害（未销号且未编排） */
 export function selectPlanableFaults(state: {
   workOrder: WorkOrderStateSlice;
-}): Array<{ id: string; label: string; severity: string; state: string }> {
-  const { faults, inspections, workOrders, switches } = state.workOrder;
+}): Array<{
+  id: string;
+  label: string;
+  severity: FaultRow['severity'];
+  state: FaultRow['state'];
+  yardId: string;
+  yardName: string;
+  switchCode: string;
+}> {
+  const { faults, inspections, workOrders, switches, yards } = state.workOrder;
   const plannedIds = new Set(workOrders.flatMap((item) => item.faultIds));
+  const severityRank = (severity: FaultRow['severity']): number =>
+    severity === 'heavy' ? 0 : severity === 'medium' ? 1 : 2;
+
   return faults
     .filter((item) => item.state === 'pending' && !plannedIds.has(item.id))
     .map((item) => {
       const inspection = inspections.find((row) => row.id === item.inspectionId);
       const switchRow = inspection ? switches.find((row) => row.id === inspection.switchId) : undefined;
+      const yard = switchRow ? yards.find((row) => row.id === switchRow.yardId) : undefined;
       return {
         id: item.id,
         label: `${switchRow?.code ?? '-'} · ${item.part} / ${item.type}`,
         severity: item.severity,
         state: item.state,
+        yardId: switchRow?.yardId ?? 'unknown',
+        yardName: yard?.name ?? '未知站场',
+        switchCode: switchRow?.code ?? '-',
       };
-    });
+    })
+    .sort(
+      (a, b) =>
+        severityRank(a.severity) - severityRank(b.severity) ||
+        a.yardName.localeCompare(b.yardName, 'zh-Hans-CN') ||
+        a.switchCode.localeCompare(b.switchCode, 'zh-Hans-CN'),
+    );
 }
 
 /** 天窗占用统计 */
